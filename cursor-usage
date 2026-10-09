@@ -1,0 +1,383 @@
+#!/usr/bin/python3
+"""Collect Cursor usage into one display-ready JSON record.
+
+Writes ~/.local/state/omarchy/agents/usage/cursor.json, the same record
+contract the omarchy-agent-usage-<agent> collectors print, so Omarchy's
+Agents panel shows Cursor next to Claude Code and Codex without changes.
+
+Everything comes from cursor.com's dashboard API (the endpoints CodexBar
+uses), authenticated with the token the signed-in Cursor CLI or app keeps
+on disk: plan limits from the usage summary, and prompts, sessions, and
+tokens by day and model from the last 30 days of usage events. Those
+events are account-wide, covering every machine and the app and CLI alike.
+"""
+
+from __future__ import annotations
+
+import base64
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "cursor"
+AGENT_NAME = "Cursor"
+AUTH_HELP = "Run `cursor-agent login` or sign in to the Cursor app to show usage."
+SUMMARY_ENDPOINT = "https://cursor.com/api/usage-summary"
+EVENTS_ENDPOINT = "https://cursor.com/api/dashboard/get-filtered-usage-events"
+EVENT_DAYS = 30
+EVENT_PAGE_SIZE = 1000
+EVENT_MAX_PAGES = 20
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+RECORD = STATE_HOME / "omarchy" / "agents" / "usage" / f"{AGENT_ID}.json"
+CACHE = CACHE_HOME / "omarchy" / "agent-usage" / f"{AGENT_ID}-usage.json"
+
+CLI_AUTH = CONFIG_HOME / "cursor" / "auth.json"
+APP_DB = CONFIG_HOME / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def date_string(value: dt.date) -> str:
+  return value.strftime("%Y-%m-%d")
+
+
+def write_json(path: Path, payload: dict[str, Any], compact: bool = False) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", dir=path.parent)
+  with os.fdopen(fd, "w") as handle:
+    handle.write(json.dumps(payload, separators=(",", ":") if compact else None, sort_keys=True) + "\n")
+  os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------- auth
+
+
+def jwt_claims(token: str) -> dict[str, Any]:
+  try:
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+  except Exception:
+    return {}
+
+
+def token_live(token: str) -> bool:
+  exp = jwt_claims(token).get("exp")
+  return isinstance(exp, (int, float)) and exp > time.time() + 60
+
+
+def cli_token() -> str:
+  try:
+    return str(json.loads(CLI_AUTH.read_text()).get("accessToken") or "")
+  except Exception:
+    return ""
+
+
+def app_token() -> str:
+  if not APP_DB.exists():
+    return ""
+  try:
+    db = sqlite3.connect(f"{APP_DB.as_uri()}?mode=ro", uri=True, timeout=1)
+    try:
+      row = db.execute("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'").fetchone()
+    finally:
+      db.close()
+  except Exception:
+    return ""
+  value = row[0] if row else ""
+  if isinstance(value, bytes):
+    value = value.decode("utf-16-le" if b"\x00" in value else "utf-8", errors="ignore")
+  return str(value or "").strip()
+
+
+# The CLI and the app each refresh their own token while they run, so take
+# whichever is still live rather than preferring one source outright.
+def access_token() -> tuple[str, bool]:
+  tokens = [t for t in (cli_token(), app_token()) if t]
+  for token in tokens:
+    if token_live(token):
+      return token, True
+  return (tokens[0] if tokens else ""), False
+
+
+# cursor.com authenticates the dashboard with a WorkOS session cookie, which
+# is the user id (the tail of the JWT subject) joined to the access token.
+def session_cookie(token: str) -> str:
+  user_id = str(jwt_claims(token).get("sub") or "").split("|")[-1]
+  return f"WorkosCursorSessionToken={user_id}%3A%3A{token}"
+
+
+def request_json(url: str, token: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+  headers = {"Cookie": session_cookie(token), "Accept": "application/json"}
+  data = None
+  if body is not None:
+    # The dashboard's POST endpoints enforce CSRF with a matching Origin.
+    headers.update({"Content-Type": "application/json", "Origin": "https://cursor.com"})
+    data = json.dumps(body).encode()
+  request = urllib.request.Request(url, data=data, headers=headers)
+  with urllib.request.urlopen(request, timeout=15) as response:
+    return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+# ------------------------------------------------------------------- limits
+
+
+def percent(value: Any) -> float:
+  try:
+    return max(0.0, min(1.0, float(value) / 100.0))
+  except (TypeError, ValueError):
+    return -1.0
+
+
+def cents_percent(bucket: Any) -> float:
+  if not isinstance(bucket, dict):
+    return -1.0
+  try:
+    used, limit = float(bucket.get("used") or 0), float(bucket.get("limit") or 0)
+  except (TypeError, ValueError):
+    return -1.0
+  return max(0.0, min(1.0, used / limit)) if limit > 0 else -1.0
+
+
+def plan_label(membership: str) -> str:
+  words = [word for word in str(membership or "").replace("-", "_").split("_") if word]
+  if words[-1:] == ["plus"]:
+    return " ".join(word.capitalize() for word in words[:-1]) + "+"
+  return " ".join(word.capitalize() for word in words)
+
+
+# usage-summary percentages are already in percent units (0.36 means 0.36%).
+# Individual plans report the total and its Auto / API split; team and
+# enterprise members may only carry a cents cap under `overall`, and a team's
+# shared pool is the last resort. `plan.used` is not a fallback while the
+# percentages exist: bonus credit lets it sit at the limit while the account
+# is far from spent. Scoped windows are titled the way Claude's are
+# ("Fable Weekly"), so "Auto Monthly" sits under "Monthly".
+def summary_limits(summary: dict[str, Any]) -> list[dict[str, Any]]:
+  resets_at = str(summary.get("billingCycleEnd") or "")
+  individual = summary.get("individualUsage") or {}
+  plan = individual.get("plan") or {}
+  team = summary.get("teamUsage") or {}
+
+  def limit(title: str, value: float) -> dict[str, Any]:
+    return {"label": title, "title": title, "percent": value, "resetsAt": resets_at}
+
+  limits = []
+  total = percent(plan.get("totalPercentUsed"))
+  if total < 0:
+    total = cents_percent(plan)
+  if total < 0:
+    total = cents_percent(individual.get("overall"))
+  if total < 0:
+    total = cents_percent(team.get("pooled"))
+  if total >= 0:
+    limits.append(limit("Monthly", total))
+
+  for key, title in (("autoPercentUsed", "Auto Monthly"), ("apiPercentUsed", "API Monthly")):
+    value = percent(plan.get(key))
+    if value >= 0:
+      limits.append(limit(title, value))
+
+  on_demand = cents_percent(individual.get("onDemand"))
+  if on_demand >= 0:
+    limits.append(limit("On-demand Monthly", on_demand))
+  return limits
+
+
+def reset_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+  try:
+    return dt.datetime.fromisoformat(str(entry.get("resetsAt"))) > now
+  except (TypeError, ValueError):
+    return False
+
+
+# A cached figure outlives the check that measured it only until its billing
+# cycle rolls over, the way the Claude collector treats its cached limits.
+def cached_limits(cache: dict[str, Any]) -> list[dict[str, Any]]:
+  now = dt.datetime.now(dt.timezone.utc)
+  return [entry for entry in cache.get("limits") or [] if isinstance(entry, dict) and reset_open(entry, now)]
+
+
+# -------------------------------------------------------------------- stats
+
+
+def fetch_events(token: str) -> list[dict[str, Any]]:
+  until = int(time.time() * 1000)
+  since = until - EVENT_DAYS * 86400 * 1000
+  events: list[dict[str, Any]] = []
+  for page in range(1, EVENT_MAX_PAGES + 1):
+    body = {"page": page, "pageSize": EVENT_PAGE_SIZE, "startDate": str(since), "endDate": str(until)}
+    rows = request_json(EVENTS_ENDPOINT, token, body).get("usageEventsDisplay") or []
+    events.extend(row for row in rows if isinstance(row, dict))
+    if len(rows) < EVENT_PAGE_SIZE:
+      break
+  return events
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, int(float(value or 0)))
+  except (TypeError, ValueError):
+    return 0
+
+
+# Cursor names Claude models version-first ("claude-4.5-sonnet-thinking");
+# put the version after the family the way Anthropic's ids do, so the panel
+# titles them "Sonnet 4.5 Thinking" like the Claude tab does. "default" is
+# what Cursor records for Auto.
+def model_name(raw: Any) -> str:
+  name = str(raw or "unknown")
+  if name == "default":
+    return "auto"
+  match = re.match(r"^claude-(\d+(?:\.\d+)?)-([a-z]+)(.*)$", name)
+  if match:
+    return f"claude-{match.group(2)}-{match.group(1).replace('.', '-')}{match.group(3)}"
+  return name
+
+
+# One usage event is one agent request, so it counts as a prompt the way a
+# Codex usage message does; its conversation is the session.
+def usage_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+  now = dt.datetime.now()
+  today = date_string(now.date())
+  recent_dates = [date_string(now.date() - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+  recent = {day: 0 for day in recent_dates}
+  model_usage: dict[str, dict[str, int]] = {}
+  today_by_model: dict[str, int] = {}
+  sessions: set[str] = set()
+  today_sessions: set[str] = set()
+  active_dates: set[str] = set()
+  prompts = today_prompts = 0
+
+  for event in events:
+    usage = event.get("tokenUsage") or {}
+    tokens = {
+      "inputTokens": number(usage.get("inputTokens")),
+      "outputTokens": number(usage.get("outputTokens")),
+      "cacheReadInputTokens": number(usage.get("cacheReadTokens")),
+      "cacheCreationInputTokens": number(usage.get("cacheWriteTokens")),
+    }
+    total = sum(tokens.values())
+    stamp = number(event.get("timestamp"))
+    if total == 0 or stamp == 0:
+      continue
+    day = date_string(dt.datetime.fromtimestamp(stamp / 1000).date())
+    model = model_name(event.get("model"))
+    session = str(event.get("conversationId") or "")
+
+    prompts += 1
+    active_dates.add(day)
+    if session:
+      sessions.add(session)
+    bucket = model_usage.setdefault(model, dict.fromkeys(tokens, 0))
+    for key, value in tokens.items():
+      bucket[key] += value
+    if day in recent:
+      recent[day] += total
+    if day == today:
+      today_prompts += 1
+      if session:
+        today_sessions.add(session)
+      today_by_model[model] = today_by_model.get(model, 0) + total
+
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": sum(today_by_model.values()),
+    "todayTokensByModel": today_by_model,
+    # messageCount carries the day's token total, as in the other collectors.
+    "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
+    "totalPrompts": prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+  }
+
+
+# ------------------------------------------------------------------- record
+
+
+def collect() -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    # Account-wide numbers: synced machines take the widest value, not the sum.
+    "scope": "account",
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": AUTH_HELP,
+    "limits": [],
+  }
+
+  # The last good answer stands in when a check fails: limits until their
+  # cycle resets, stats for the rest of the day they were counted on.
+  try:
+    cache = json.loads(CACHE.read_text())
+  except Exception:
+    cache = {}
+  today = date_string(dt.date.today())
+  stats = cache.get("stats") if cache.get("statsDate") == today else None
+  record["limits"] = cached_limits(cache)
+  record["tierLabel"] = str(cache.get("tierLabel") or "")
+
+  token, live = access_token()
+  if not token:
+    record["usageStatusText"] = "Waiting for auth"
+  elif not live:
+    record["usageStatusText"] = "Sign-in expired"
+    record["authHelpText"] = "Cursor's saved sign-in expired. Run `cursor-agent` or open Cursor to refresh it."
+  else:
+    try:
+      summary = request_json(SUMMARY_ENDPOINT, token)
+      record["limits"] = summary_limits(summary)
+      record["tierLabel"] = plan_label(summary.get("membershipType"))
+      cache.update(limits=record["limits"], tierLabel=record["tierLabel"])
+    except Exception as error:
+      if not record["limits"]:
+        record["usageStatusText"] = "Cursor limits unavailable"
+        code = getattr(error, "code", None)
+        record["authHelpText"] = f"cursor.com returned status {code}." if code else "Couldn't reach cursor.com."
+    try:
+      stats = usage_stats(fetch_events(token))
+      cache.update(stats=stats, statsDate=today)
+    except Exception:
+      pass
+    write_json(CACHE, cache)
+
+  record.update(stats or usage_stats([]))
+  record["ready"] = len(record["limits"]) > 0 or record["totalPrompts"] > 0
+  return record
+
+
+def main() -> int:
+  # Omarchy is adding a Cursor collector of its own (omacom/omarchy#14040)
+  # that writes the same record. Once it ships, step aside rather than
+  # overwrite it on every run.
+  if shutil.which("omarchy-agent-usage-cursor"):
+    return 0
+  record = collect()
+  if "--print" in sys.argv[1:]:
+    print(json.dumps(record, indent=2, sort_keys=True))
+  else:
+    write_json(RECORD, record, compact=True)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
