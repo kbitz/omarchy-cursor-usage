@@ -19,6 +19,24 @@ omarchy plugin add https://github.com/kbitz/omarchy-cursor-usage.git --enable
 Cursor shows up in the Agents panel the next time it refreshes. Opening the
 panel triggers one.
 
+## Update
+
+```bash
+omarchy plugin update kbitz.cursor-usage
+```
+
+Plugin updates are not part of `omarchy update`. The command above fetches
+this repo's `main` branch, shows a diff of what would change, and
+fast-forwards the checkout in `~/.config/omarchy/plugins/` once you confirm;
+the shell reloads the plugin straight away. `omarchy plugin update` with no
+id updates every git-managed plugin the same way. Because updates are a
+fast-forward pull, edits made inside the installed checkout will block them.
+
+Releases bump the `version` in `manifest.json` (semver) for reference, but
+Omarchy decides an update is available by comparing commits on `main`, not
+by comparing versions — so `main` is the release channel, and every commit
+landed there is what `omarchy plugin update` will offer.
+
 ## How it works
 
 The Agents panel draws every JSON record in
